@@ -14,6 +14,11 @@
 
 **Note:** CI/CD has ECR-only permissions. S3 config is not used by CI/CD.
 
+### 🔐 Logging & Masking in CI/CD
+- CI/CD workflow masks `account_id`, `iam_role_arn`, và `ecr_registry` và không in ra logs.
+- Chỉ hiển thị `region` và nguồn cấu hình (Env/Secrets hoặc `config/aws.json`).
+- Tránh rò rỉ danh tính tài khoản/ARN trên logs công khai.
+
 ## Configuration Priority
 
 The system loads configuration in this order (highest to lowest priority):
@@ -21,6 +26,8 @@ The system loads configuration in this order (highest to lowest priority):
 1. **GitHub Secrets** (recommended for production)
 2. **Environment Variables**
 3. **config/aws.json** (fallback for development)
+
+> Region không có giá trị mặc định trong CI/CD. Nếu thiếu `AWS_REGION` ở Secrets/ENV và `config/aws.json`, workflow sẽ fail sớm.
 
 ## Setup Options
 
@@ -75,7 +82,7 @@ export AWS_ECR_REGISTRY="123456789012.dkr.ecr.ap-southeast-2.amazonaws.com"
 
 ## Validation
 
-Config được tự động validate trong CI/CD workflow. 
+Config được tự động validate trong CI/CD workflow (JSON Schema `config/aws.schema.json`). 
 
 Để validate JSON syntax local:
 ```bash

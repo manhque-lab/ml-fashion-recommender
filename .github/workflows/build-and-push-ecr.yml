@@ -56,6 +56,16 @@ jobs:
         with:
           fetch-depth: 1  # Minimal fetch for production speed
 
+      - name: Validate AWS config schema (if present)
+        run: |
+          set -euo pipefail
+          if [ -f "config/aws.json" ]; then
+            echo "🔎 Validating config/aws.json against config/aws.schema.json"
+            npx --yes ajv-cli validate -s config/aws.schema.json -d config/aws.json --strict=false
+          else
+            echo "ℹ️ config/aws.json not found; skipping schema validation"
+          fi
+
       - name: Detect changed components (Production Optimized)
         id: changes
         run: |
@@ -187,7 +197,11 @@ jobs:
             exit 1
           })
           
-          REGION=$(get_config "AWS_REGION" ".region" "ap-southeast-2")
+          REGION=$(get_config "AWS_REGION" ".region" || true)
+          if [ -z "${REGION:-}" ]; then
+            echo "❌ Error: AWS_REGION not found in secrets or config file" >&2
+            exit 1
+          fi
           
           IAM_ROLE_ARN=$(get_config "AWS_IAM_ROLE_ARN" ".iam_role_arn" || {
             echo "❌ Error: AWS_IAM_ROLE_ARN not found in secrets or config file" >&2
@@ -220,22 +234,24 @@ jobs:
             exit 1
           fi
           
-          # Determine config source
-          if [ -n "${AWS_ACCOUNT_ID:-}" ] && [ "${AWS_ACCOUNT_ID}" != "null" ]; then
-            CONFIG_SOURCE="GitHub Secrets"
+          # Mask sensitive values in logs
+          echo "::add-mask::$ACCOUNT_ID"
+          echo "::add-mask::$IAM_ROLE_ARN"
+          echo "::add-mask::$ECR_REGISTRY"
+
+          # Determine config source (Env/Secrets vs File)
+          if [ -n "${AWS_ACCOUNT_ID:-}" ] || [ -n "${AWS_REGION:-}" ] || [ -n "${AWS_IAM_ROLE_ARN:-}" ] || [ -n "${AWS_ECR_REGISTRY:-}" ]; then
+            CONFIG_SOURCE="Env/Secrets"
           elif [ -f "$CONFIG_FILE" ]; then
             CONFIG_SOURCE="config/aws.json"
           else
-            CONFIG_SOURCE="Environment Variables"
+            CONFIG_SOURCE="Unknown"
           fi
           
           echo "✅ AWS configuration loaded from: $CONFIG_SOURCE"
           echo ""
           echo "📋 Configuration (ECR only):"
-          echo "  Account ID: $ACCOUNT_ID"
           echo "  Region: $REGION"
-          echo "  IAM Role: $IAM_ROLE_ARN"
-          echo "  ECR Registry: $ECR_REGISTRY"
           
           # Output values for subsequent steps
           echo "account_id=$ACCOUNT_ID" >> $GITHUB_OUTPUT
@@ -464,7 +480,7 @@ jobs:
           echo "| **Short SHA** | \`${SHORT_SHA}\` |" >> $GITHUB_STEP_SUMMARY
           echo "| **Registry** | \`$ECR_REGISTRY\` |" >> $GITHUB_STEP_SUMMARY
           echo "| **Region** | \`$AWS_REGION\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Account ID** | \`$ACCOUNT_ID\` |" >> $GITHUB_STEP_SUMMARY
+          # Do not expose Account ID in logs
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Primary Image URL:**" >> $GITHUB_STEP_SUMMARY
           echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
