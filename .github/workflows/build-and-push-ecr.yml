@@ -99,6 +99,11 @@ jobs:
     needs: detect-changes
     if: needs.detect-changes.outputs.components != '[]'
     runs-on: ubuntu-latest
+    permissions:
+      id-token: write  # Required for OIDC authentication with AWS
+      contents: read   # Required for checkout
+    env:
+      REPO_PREFIX: ml-fashion-recommender  # Fixed ECR namespace for all components
     strategy:
       matrix:
         component: ${{ fromJson(needs.detect-changes.outputs.components) }}
@@ -303,6 +308,7 @@ jobs:
           COMPONENT: ${{ matrix.component }}
           ECR_REGISTRY: ${{ steps.aws-config.outputs.ecr_registry }}
           AWS_REGION: ${{ steps.aws-config.outputs.region }}
+          REPO_PREFIX: ${{ env.REPO_PREFIX }}
         run: |
           set -euo pipefail
           
@@ -327,13 +333,14 @@ jobs:
           fi
           
           # Build Docker image with immutable tags (BigTech ML standard)
-          BUILD_CMD="docker build -t $ECR_REGISTRY/$COMPONENT:${PRIMARY_TAG}"
+          REPO_PATH="$ECR_REGISTRY/$REPO_PREFIX/$COMPONENT"
+          BUILD_CMD="docker build -t $REPO_PATH:${PRIMARY_TAG}"
           
           # Add additional tags (full SHA and branch-latest for main/develop)
           IFS=',' read -ra TAG_ARRAY <<< "$ADDITIONAL_TAGS"
           for tag in "${TAG_ARRAY[@]}"; do
             if [ -n "$tag" ]; then
-              BUILD_CMD="$BUILD_CMD -t $ECR_REGISTRY/$COMPONENT:${tag}"
+              BUILD_CMD="$BUILD_CMD -t $REPO_PATH:${tag}"
             fi
           done
           
@@ -351,31 +358,6 @@ jobs:
           
           echo "✅ Build completed for $COMPONENT:${PRIMARY_TAG}"
 
-      - name: Verify ECR repository exists
-        env:
-          COMPONENT: ${{ matrix.component }}
-          ECR_REGISTRY: ${{ steps.aws-config.outputs.ecr_registry }}
-          AWS_REGION: ${{ steps.aws-config.outputs.region }}
-          ACCOUNT_ID: ${{ steps.aws-config.outputs.account_id }}
-        run: |
-          set -euo pipefail
-          
-          REPO_NAME="$COMPONENT"
-          echo "🔍 Verifying ECR repository: $REPO_NAME"
-          
-          # Check if repository exists, create if not
-          if ! aws ecr describe-repositories --repository-names "$REPO_NAME" --region "$AWS_REGION" &>/dev/null; then
-            echo "📦 Creating ECR repository: $REPO_NAME"
-            aws ecr create-repository \
-              --repository-name "$REPO_NAME" \
-              --region "$AWS_REGION" \
-              --image-scanning-configuration scanOnPush=true \
-              --encryption-configuration encryptionType=AES256 || true
-            echo "✅ Repository created (or already exists)"
-          else
-            echo "✅ Repository already exists"
-          fi
-
       - name: Push Docker images to ECR
         env:
           COMPONENT: ${{ matrix.component }}
@@ -383,10 +365,12 @@ jobs:
           PRIMARY_TAG: ${{ steps.image-tags.outputs.tag }}
           ADDITIONAL_TAGS: ${{ steps.image-tags.outputs.additional_tags }}
           AWS_REGION: ${{ steps.aws-config.outputs.region }}
+          REPO_PREFIX: ${{ env.REPO_PREFIX }}
         run: |
           set -euo pipefail
           
           echo "🚀 Pushing images to ECR with immutable tags..."
+          REPO_NAME="$REPO_PREFIX/$COMPONENT"
           
           # Function to push with retry
           push_with_retry() {
@@ -395,8 +379,8 @@ jobs:
             local retry_count=0
             
             while [ $retry_count -lt $max_retries ]; do
-              if docker push "$ECR_REGISTRY/$COMPONENT:${image_tag}"; then
-                echo "✅ Successfully pushed $ECR_REGISTRY/$COMPONENT:${image_tag}"
+              if docker push "$ECR_REGISTRY/$REPO_PREFIX/$COMPONENT:${image_tag}"; then
+                echo "✅ Successfully pushed $ECR_REGISTRY/$REPO_PREFIX/$COMPONENT:${image_tag}"
                 return 0
               else
                 retry_count=$((retry_count + 1))
@@ -430,7 +414,7 @@ jobs:
           done
           
           # Display image digest (from primary tag)
-          IMAGE_DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' $ECR_REGISTRY/$COMPONENT:${PRIMARY_TAG} 2>/dev/null || echo "N/A")
+          IMAGE_DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' $ECR_REGISTRY/$REPO_PREFIX/$COMPONENT:${PRIMARY_TAG} 2>/dev/null || echo "N/A")
           echo "📋 Image digest: $IMAGE_DIGEST"
 
       - name: Build Summary
@@ -443,6 +427,7 @@ jobs:
           SHORT_SHA: ${{ steps.image-tags.outputs.short_sha }}
           AWS_REGION: ${{ steps.aws-config.outputs.region }}
           ACCOUNT_ID: ${{ steps.aws-config.outputs.account_id }}
+          REPO_PREFIX: ${{ env.REPO_PREFIX }}
         run: |
           echo "### ✅ Build and Push Summary" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -458,7 +443,7 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Primary Image URL:**" >> $GITHUB_STEP_SUMMARY
           echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
-          echo "$ECR_REGISTRY/$COMPONENT:${PRIMARY_TAG}" >> $GITHUB_STEP_SUMMARY
+          echo "$ECR_REGISTRY/$REPO_PREFIX/$COMPONENT:${PRIMARY_TAG}" >> $GITHUB_STEP_SUMMARY
           echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           if [ -n "$ADDITIONAL_TAGS" ]; then
@@ -466,7 +451,7 @@ jobs:
             IFS=',' read -ra TAG_ARRAY <<< "$ADDITIONAL_TAGS"
             for tag in "${TAG_ARRAY[@]}"; do
               if [ -n "$tag" ]; then
-                echo "- \`$ECR_REGISTRY/$COMPONENT:${tag}\`" >> $GITHUB_STEP_SUMMARY
+                echo "- \`$ECR_REGISTRY/$REPO_PREFIX/$COMPONENT:${tag}\`" >> $GITHUB_STEP_SUMMARY
               fi
             done
           fi
