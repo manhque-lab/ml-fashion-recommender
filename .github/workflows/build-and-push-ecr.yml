@@ -44,7 +44,7 @@ on:
 
 env:
   PYTHON_VERSION: "3.10"
-  AWS_CONFIG_FILE: config/aws.json
+  # Note: AWS_CONFIG_FILE not used in CI/CD - GitHub Secrets only for security
 
 jobs:
   detect-changes:
@@ -55,16 +55,6 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 1  # Minimal fetch for production speed
-
-      - name: Validate AWS config schema (if present)
-        run: |
-          set -euo pipefail
-          if [ -f "config/aws.json" ]; then
-            echo "🔎 Validating config/aws.json against config/aws.schema.json"
-            npx --yes ajv-cli validate -s config/aws.schema.json -d config/aws.json --strict=false
-          else
-            echo "ℹ️ config/aws.json not found; skipping schema validation"
-          fi
 
       - name: Detect changed components (Production Optimized)
         id: changes
@@ -104,12 +94,9 @@ jobs:
             exit 0
           fi
           
-          # Config change forces full build
-          if echo "$CHANGED" | grep -m1 -q '^config/aws\.json$'; then
-            echo "✅ Config changed: building all components"
-            echo "components=$ALL" >> $GITHUB_OUTPUT
-            exit 0
-          fi
+          # Note: config/aws.json changes are ignored in CI/CD
+          # CI/CD uses GitHub Secrets exclusively (no config file fallback)
+          # Config file is for local development only
           
           # Extract component names and emit as JSON array
           COMPONENTS_JSON=$(echo "$CHANGED" | awk -F/ '
@@ -148,70 +135,63 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Load AWS configuration (ENV-first approach)
+      - name: Load AWS configuration (Secrets-only, Zero-Trust)
         id: aws-config-loader
         env:
-          # GitHub Secrets (highest priority) - fallback to config file
+          # GitHub Secrets ONLY - no config file fallback for security
+          # This follows BigTech best practice: zero-trust in CI/CD
           AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
           AWS_REGION: ${{ secrets.AWS_REGION }}
           AWS_IAM_ROLE_ARN: ${{ secrets.AWS_IAM_ROLE_ARN }}
           AWS_ECR_REGISTRY: ${{ secrets.AWS_ECR_REGISTRY }}
         run: |
-          CONFIG_FILE="${{ env.AWS_CONFIG_FILE }}"
+          set -euo pipefail
           
-          # Function to get value: ENV var > GitHub Secret > JSON file
-          get_config() {
-            local env_var=$1
-            local json_path=$2
-            local default_value=${3:-}
-            
-            # Priority 1: Environment variable (from GitHub Secrets or workflow env)
-            if [ -n "${!env_var:-}" ] && [ "${!env_var}" != "null" ]; then
-              echo "${!env_var}"
-              return 0
-            fi
-            
-            # Priority 2: JSON file (fallback)
-            if [ -f "$CONFIG_FILE" ]; then
-              if jq empty "$CONFIG_FILE" 2>/dev/null; then
-                local value=$(jq -r "$json_path // empty" "$CONFIG_FILE" 2>/dev/null || echo "")
-                if [ -n "$value" ] && [ "$value" != "null" ] && [ "$value" != "" ]; then
-                  echo "$value"
-                  return 0
-                fi
-              fi
-            fi
-            
-            # Priority 3: Default value
-            if [ -n "$default_value" ]; then
-              echo "$default_value"
-              return 0
-            fi
-            
-            return 1
-          }
+          # BigTech Security Principle: Secrets-only in CI/CD
+          # No config file fallback to prevent accidental exposure
+          # Config files are for local development only
           
-          # Load config values with priority
-          ACCOUNT_ID=$(get_config "AWS_ACCOUNT_ID" ".account_id" || {
-            echo "❌ Error: AWS_ACCOUNT_ID not found in secrets or config file" >&2
-            exit 1
-          })
+          # Validate all required secrets are present
+          MISSING_SECRETS=()
           
-          REGION=$(get_config "AWS_REGION" ".region" || true)
-          if [ -z "${REGION:-}" ]; then
-            echo "❌ Error: AWS_REGION not found in secrets or config file" >&2
+          if [ -z "${AWS_ACCOUNT_ID:-}" ] || [ "${AWS_ACCOUNT_ID}" = "null" ]; then
+            MISSING_SECRETS+=("AWS_ACCOUNT_ID")
+          fi
+          
+          if [ -z "${AWS_REGION:-}" ] || [ "${AWS_REGION}" = "null" ]; then
+            MISSING_SECRETS+=("AWS_REGION")
+          fi
+          
+          if [ -z "${AWS_IAM_ROLE_ARN:-}" ] || [ "${AWS_IAM_ROLE_ARN}" = "null" ]; then
+            MISSING_SECRETS+=("AWS_IAM_ROLE_ARN")
+          fi
+          
+          if [ -z "${AWS_ECR_REGISTRY:-}" ] || [ "${AWS_ECR_REGISTRY}" = "null" ]; then
+            MISSING_SECRETS+=("AWS_ECR_REGISTRY")
+          fi
+          
+          if [ ${#MISSING_SECRETS[@]} -gt 0 ]; then
+            echo "❌ Error: Missing required GitHub Secrets:" >&2
+            printf "   - %s\n" "${MISSING_SECRETS[@]}" >&2
+            echo "" >&2
+            echo "📋 Setup Instructions:" >&2
+            echo "   1. Go to Repository Settings → Secrets and variables → Actions" >&2
+            echo "   2. Add the following secrets:" >&2
+            echo "      - AWS_ACCOUNT_ID: Your AWS account ID (12 digits)" >&2
+            echo "      - AWS_REGION: AWS region (e.g., ap-southeast-2)" >&2
+            echo "      - AWS_IAM_ROLE_ARN: IAM role ARN for GitHub Actions OIDC" >&2
+            echo "      - AWS_ECR_REGISTRY: ECR registry URL" >&2
+            echo "" >&2
+            echo "🔒 Security Note: Config files are NOT used in CI/CD for security." >&2
+            echo "   Use GitHub Secrets exclusively in production." >&2
             exit 1
           fi
           
-          IAM_ROLE_ARN=$(get_config "AWS_IAM_ROLE_ARN" ".iam_role_arn" || {
-            echo "❌ Error: AWS_IAM_ROLE_ARN not found in secrets or config file" >&2
-            exit 1
-          })
-          
-          ECR_REGISTRY=$(get_config "AWS_ECR_REGISTRY" ".ecr_registry" || {
-            echo "❌ Error: AWS_ECR_REGISTRY not found in secrets or config file" >&2
-            exit 1
-          })
+          # Assign validated values
+          ACCOUNT_ID="${AWS_ACCOUNT_ID}"
+          REGION="${AWS_REGION}"
+          IAM_ROLE_ARN="${AWS_IAM_ROLE_ARN}"
+          ECR_REGISTRY="${AWS_ECR_REGISTRY}"
           
           # Validate formats
           if [[ ! "$ACCOUNT_ID" =~ ^[0-9]{12}$ ]]; then
@@ -234,31 +214,23 @@ jobs:
             exit 1
           fi
           
-          # Mask sensitive values in logs
+          # Mask sensitive values in logs (security best practice)
           echo "::add-mask::$ACCOUNT_ID"
           echo "::add-mask::$IAM_ROLE_ARN"
           echo "::add-mask::$ECR_REGISTRY"
-
-          # Determine config source (Env/Secrets vs File)
-          if [ -n "${AWS_ACCOUNT_ID:-}" ] || [ -n "${AWS_REGION:-}" ] || [ -n "${AWS_IAM_ROLE_ARN:-}" ] || [ -n "${AWS_ECR_REGISTRY:-}" ]; then
-            CONFIG_SOURCE="Env/Secrets"
-          elif [ -f "$CONFIG_FILE" ]; then
-            CONFIG_SOURCE="config/aws.json"
-          else
-            CONFIG_SOURCE="Unknown"
-          fi
           
-          echo "✅ AWS configuration loaded from: $CONFIG_SOURCE"
+          echo "✅ AWS configuration loaded from: GitHub Secrets (zero-trust)"
           echo ""
-          echo "📋 Configuration (ECR only):"
+          echo "📋 Configuration (ECR only, masked for security):"
           echo "  Region: $REGION"
+          echo "  Source: GitHub Secrets (no config file used in CI/CD)"
           
           # Output values for subsequent steps
           echo "account_id=$ACCOUNT_ID" >> $GITHUB_OUTPUT
           echo "region=$REGION" >> $GITHUB_OUTPUT
           echo "iam_role_arn=$IAM_ROLE_ARN" >> $GITHUB_OUTPUT
           echo "ecr_registry=$ECR_REGISTRY" >> $GITHUB_OUTPUT
-          echo "config_source=$CONFIG_SOURCE" >> $GITHUB_OUTPUT
+          echo "config_source=GitHub Secrets" >> $GITHUB_OUTPUT
 
       - name: Validate AWS configuration
         id: validate-config
