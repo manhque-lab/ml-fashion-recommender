@@ -13,7 +13,6 @@ This follows BigTech security principles:
 
 ### ✅ Safe to Commit (Non-Sensitive)
 - Configuration structure (`aws.schema.json`)
-- Example configurations (`aws.example.json`, `aws.json.template`)
 - Documentation files
 
 ### 🔒 Never Commit (Sensitive - Use Secrets Only)
@@ -59,13 +58,7 @@ Use `config/aws.json` for local development only (not used in CI/CD).
 
 ### 💻 Local Development Setup
 
-**Option 1: Config File (Recommended for Local)**
-
-1. Copy template: `cp config/aws.json.template config/aws.json`
-2. Fill in your values (file is already in `.gitignore`)
-3. Use for local scripts and testing
-
-**Option 2: Environment Variables**
+Use Environment Variables (recommended):
 
 ```bash
 export AWS_ACCOUNT_ID="123456789012"
@@ -74,7 +67,7 @@ export AWS_IAM_ROLE_ARN="arn:aws:iam::123456789012:role/github-actions-role"
 export AWS_ECR_REGISTRY="123456789012.dkr.ecr.ap-southeast-2.amazonaws.com"
 ```
 
-**⚠️ Important**: Config files are **NOT** used in CI/CD for security. Always use GitHub Secrets for production.
+**⚠️ Important**: Config files are not provided. Use env vars locally; GitHub Secrets in CI/CD.
 
 ## Files
 
@@ -92,7 +85,7 @@ export AWS_ECR_REGISTRY="123456789012.dkr.ecr.ap-southeast-2.amazonaws.com"
 
 ### 2. Separation of Concerns
 - **CI/CD**: Uses GitHub Secrets only (encrypted, access-controlled)
-- **Local Dev**: Uses config files (convenient, safe in `.gitignore`)
+- **Local Dev**: Uses environment variables
 
 ### 3. Defense in Depth
 - Config files in `.gitignore` (prevent accidental commits)
@@ -109,13 +102,9 @@ If secrets are missing, workflow shows:
 ## Validation
 
 ### Local Development
-Validate your local config file:
+Validate environment is set correctly:
 ```bash
-# JSON syntax check
-jq empty config/aws.json
-
-# Schema validation (optional, requires ajv-cli)
-npx --yes ajv-cli validate -s config/aws.schema.json -d config/aws.json
+env | rg "^AWS_(ACCOUNT_ID|REGION|IAM_ROLE_ARN|ECR_REGISTRY)="
 ```
 
 ### CI/CD
@@ -131,8 +120,8 @@ npx --yes ajv-cli validate -s config/aws.schema.json -d config/aws.json
 3. Check secret values are not empty
 4. Re-run the workflow
 
-### Local scripts can't find config
-1. Verify `config/aws.json` exists
-2. Check file is not empty: `cat config/aws.json`
-3. Validate JSON syntax: `jq empty config/aws.json`
+### Local scripts can't find AWS settings
+1. Verify env vars are exported in your shell/profile
+2. Print vars: `echo $AWS_ACCOUNT_ID $AWS_REGION`
+3. For Windows PowerShell, use: `$env:AWS_REGION = "ap-southeast-2"`
 

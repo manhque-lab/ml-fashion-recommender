@@ -32,7 +32,6 @@ on:
       - develop
     paths:
       - 'components/**'
-      - 'config/aws.json'
       - '.github/workflows/build-and-push-ecr.yml'
   pull_request:
     branches:
@@ -40,7 +39,6 @@ on:
       - develop
     paths:
       - 'components/**'
-      - 'config/aws.json'
 
 env:
   PYTHON_VERSION: "3.10"
