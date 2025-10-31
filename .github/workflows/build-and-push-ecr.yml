@@ -29,61 +29,71 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 1  # Minimal fetch for production speed
 
-      - name: Fetch base branch (for PRs)
-        if: github.event_name == 'pull_request'
-        run: |
-          git fetch origin ${{ github.base_ref }}:refs/remotes/origin/${{ github.base_ref }}
-
-      - name: Detect changed components
+      - name: Detect changed components (Production Optimized)
         id: changes
         run: |
-          COMPONENTS_JSON="[]"
+          set -euo pipefail
           
-          # Determine base SHA for comparison
-          if [ "${{ github.event_name }}" == "pull_request" ]; then
-            BASE_SHA=$(git merge-base HEAD origin/${{ github.base_ref }} || git rev-parse origin/${{ github.base_ref }})
-            echo "PR: Comparing HEAD with $BASE_SHA (base: ${{ github.base_ref }})"
-          else
-            # For push events, compare with previous commit
-            BASE_SHA=$(git rev-parse HEAD~1 2>/dev/null || echo "")
-            if [ -z "$BASE_SHA" ]; then
-              # First commit, build all
-              echo "First commit detected, building all components"
-              COMPONENTS_JSON='["data_ingestion","data_processing","data_eda","train","inference"]'
-              echo "components=$COMPONENTS_JSON" >> $GITHUB_OUTPUT
-              echo "Detected changed components: all (first commit)"
-              exit 0
-            fi
-            echo "Push: Comparing HEAD with $BASE_SHA"
+          echo "🔍 Detecting changed components (production mode)..."
+          ALL='["data_ingestion","data_processing","data_eda","train","inference"]'
+          
+          # First commit: build all
+          PARENT_SHA=$(git rev-parse --verify HEAD^ 2>/dev/null || echo "")
+          if [ -z "$PARENT_SHA" ]; then
+            echo "✅ First commit: building all components"
+            echo "components=$ALL" >> $GITHUB_OUTPUT
+            exit 0
           fi
           
-          # Check if config changed (affects all components)
-          if git diff --name-only $BASE_SHA HEAD | grep -q "^config/aws.json$"; then
-            echo "AWS config changed, building all components"
-            COMPONENTS_JSON='["data_ingestion","data_processing","data_eda","train","inference"]'
+          # Determine base commit quickly
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            git fetch --depth=1 origin ${{ github.base_ref }}:refs/remotes/origin/${{ github.base_ref }} 2>/dev/null || true
+            BASE_SHA=$(git merge-base HEAD origin/${{ github.base_ref }} 2>/dev/null || echo "")
           else
-            # Check each component
-            CHANGED_COMPONENTS=()
-            for component in data_ingestion data_processing data_eda train inference; do
-              if git diff --name-only $BASE_SHA HEAD | grep -q "^components/$component/"; then
-                CHANGED_COMPONENTS+=("\"$component\"")
-                echo "Component $component has changes"
-              fi
-            done
-            
-            # Build JSON array
-            if [ ${#CHANGED_COMPONENTS[@]} -gt 0 ]; then
-              COMPONENTS_JSON="[$(IFS=,; echo "${CHANGED_COMPONENTS[*]}")]"
-            else
-              # No changes detected in components, skip build
-              COMPONENTS_JSON="[]"
-            fi
+            BASE_SHA="$PARENT_SHA"
+          fi
+          
+          if [ -z "$BASE_SHA" ]; then
+            echo "⚠️  Cannot determine base SHA, building all"
+            echo "components=$ALL" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          # Fast diff and single-pass extraction
+          CHANGED=$(git diff --name-only --diff-filter=ACMR "$BASE_SHA" HEAD 2>/dev/null || echo "")
+          if [ -z "$CHANGED" ]; then
+            echo "⚠️  No changes detected"
+            echo "components=[]" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          # Config change forces full build
+          if echo "$CHANGED" | grep -m1 -q '^config/aws\.json$'; then
+            echo "✅ Config changed: building all components"
+            echo "components=$ALL" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          # Extract component names and emit as JSON array
+          COMPONENTS_JSON=$(echo "$CHANGED" | awk -F/ '
+            BEGIN { OFS="" }
+            /^components\/(data_ingestion|data_processing|data_eda|train|inference)\// { seen[$2]=1 }
+            END {
+              n=0; printf "[";
+              for (k in seen) { if (n++) printf ","; printf "\"" k "\"" }
+              printf "]";
+            }')
+          
+          # If empty, no component changes
+          if [ "$COMPONENTS_JSON" = "[]" ]; then
+            echo "⚠️  No component changes"
+          else
+            echo "✅ Changed components: $COMPONENTS_JSON"
           fi
           
           echo "components=$COMPONENTS_JSON" >> $GITHUB_OUTPUT
-          echo "Detected changed components: $COMPONENTS_JSON"
 
   build-and-push:
     needs: detect-changes
@@ -460,3 +470,4 @@ jobs:
               fi
             done
           fi
+
