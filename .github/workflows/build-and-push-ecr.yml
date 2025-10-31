@@ -1,3 +1,28 @@
+# =============================================================================
+# Workflow: Build and Push to ECR (ML Platform CI/CD)
+#
+# Purpose
+# - Build and push Docker images for ML components to AWS ECR using immutable tags.
+# - Triggered only when relevant files change to minimize CI cost/time.
+#
+# Job Order
+# 1) detect-changes
+#    - Fast change detection for monorepo components.
+#    - Output: components (JSON array) -> drives matrix in build job.
+#    - Special cases: first commit, PR base, and config/aws.json force full build.
+#
+# 2) build-and-push
+#    - Matrix over changed components only.
+#    - Loads AWS config (ENV/secrets-first), assumes OIDC for credentials.
+#    - Builds images with immutable tags (branch + SHA variants).
+#    - Standardized ECR namespace: ml-fashion-recommender/<component>.
+#    - Pushes to ECR and summarizes artifacts.
+#
+# Conventions
+# - Immutable tags only (no generic latest); includes full SHA and branch tags.
+# - Least-privilege permissions with OIDC (id-token: write).
+# - Deterministic build/push sequence; no behavioral drift across runs.
+# =============================================================================
 name: Build and Push to ECR
 
 on:
