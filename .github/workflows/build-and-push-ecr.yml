@@ -1,0 +1,462 @@
+name: Build and Push to ECR
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+    paths:
+      - 'components/**'
+      - 'config/aws.json'
+      - '.github/workflows/build-and-push-ecr.yml'
+  pull_request:
+    branches:
+      - main
+      - develop
+    paths:
+      - 'components/**'
+      - 'config/aws.json'
+
+env:
+  PYTHON_VERSION: "3.10"
+  AWS_CONFIG_FILE: config/aws.json
+
+jobs:
+  detect-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      components: ${{ steps.changes.outputs.components }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch base branch (for PRs)
+        if: github.event_name == 'pull_request'
+        run: |
+          git fetch origin ${{ github.base_ref }}:refs/remotes/origin/${{ github.base_ref }}
+
+      - name: Detect changed components
+        id: changes
+        run: |
+          COMPONENTS_JSON="[]"
+          
+          # Determine base SHA for comparison
+          if [ "${{ github.event_name }}" == "pull_request" ]; then
+            BASE_SHA=$(git merge-base HEAD origin/${{ github.base_ref }} || git rev-parse origin/${{ github.base_ref }})
+            echo "PR: Comparing HEAD with $BASE_SHA (base: ${{ github.base_ref }})"
+          else
+            # For push events, compare with previous commit
+            BASE_SHA=$(git rev-parse HEAD~1 2>/dev/null || echo "")
+            if [ -z "$BASE_SHA" ]; then
+              # First commit, build all
+              echo "First commit detected, building all components"
+              COMPONENTS_JSON='["data_ingestion","data_processing","data_eda","train","inference"]'
+              echo "components=$COMPONENTS_JSON" >> $GITHUB_OUTPUT
+              echo "Detected changed components: all (first commit)"
+              exit 0
+            fi
+            echo "Push: Comparing HEAD with $BASE_SHA"
+          fi
+          
+          # Check if config changed (affects all components)
+          if git diff --name-only $BASE_SHA HEAD | grep -q "^config/aws.json$"; then
+            echo "AWS config changed, building all components"
+            COMPONENTS_JSON='["data_ingestion","data_processing","data_eda","train","inference"]'
+          else
+            # Check each component
+            CHANGED_COMPONENTS=()
+            for component in data_ingestion data_processing data_eda train inference; do
+              if git diff --name-only $BASE_SHA HEAD | grep -q "^components/$component/"; then
+                CHANGED_COMPONENTS+=("\"$component\"")
+                echo "Component $component has changes"
+              fi
+            done
+            
+            # Build JSON array
+            if [ ${#CHANGED_COMPONENTS[@]} -gt 0 ]; then
+              COMPONENTS_JSON="[$(IFS=,; echo "${CHANGED_COMPONENTS[*]}")]"
+            else
+              # No changes detected in components, skip build
+              COMPONENTS_JSON="[]"
+            fi
+          fi
+          
+          echo "components=$COMPONENTS_JSON" >> $GITHUB_OUTPUT
+          echo "Detected changed components: $COMPONENTS_JSON"
+
+  build-and-push:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.components != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        component: ${{ fromJson(needs.detect-changes.outputs.components) }}
+      fail-fast: false
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Load AWS configuration (ENV-first approach)
+        id: aws-config-loader
+        env:
+          # GitHub Secrets (highest priority) - fallback to config file
+          AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          AWS_IAM_ROLE_ARN: ${{ secrets.AWS_IAM_ROLE_ARN }}
+          AWS_ECR_REGISTRY: ${{ secrets.AWS_ECR_REGISTRY }}
+        run: |
+          CONFIG_FILE="${{ env.AWS_CONFIG_FILE }}"
+          
+          # Function to get value: ENV var > GitHub Secret > JSON file
+          get_config() {
+            local env_var=$1
+            local json_path=$2
+            local default_value=${3:-}
+            
+            # Priority 1: Environment variable (from GitHub Secrets or workflow env)
+            if [ -n "${!env_var:-}" ] && [ "${!env_var}" != "null" ]; then
+              echo "${!env_var}"
+              return 0
+            fi
+            
+            # Priority 2: JSON file (fallback)
+            if [ -f "$CONFIG_FILE" ]; then
+              if jq empty "$CONFIG_FILE" 2>/dev/null; then
+                local value=$(jq -r "$json_path // empty" "$CONFIG_FILE" 2>/dev/null || echo "")
+                if [ -n "$value" ] && [ "$value" != "null" ] && [ "$value" != "" ]; then
+                  echo "$value"
+                  return 0
+                fi
+              fi
+            fi
+            
+            # Priority 3: Default value
+            if [ -n "$default_value" ]; then
+              echo "$default_value"
+              return 0
+            fi
+            
+            return 1
+          }
+          
+          # Load config values with priority
+          ACCOUNT_ID=$(get_config "AWS_ACCOUNT_ID" ".account_id" || {
+            echo "❌ Error: AWS_ACCOUNT_ID not found in secrets or config file" >&2
+            exit 1
+          })
+          
+          REGION=$(get_config "AWS_REGION" ".region" "ap-southeast-2")
+          
+          IAM_ROLE_ARN=$(get_config "AWS_IAM_ROLE_ARN" ".iam_role_arn" || {
+            echo "❌ Error: AWS_IAM_ROLE_ARN not found in secrets or config file" >&2
+            exit 1
+          })
+          
+          ECR_REGISTRY=$(get_config "AWS_ECR_REGISTRY" ".ecr_registry" || {
+            echo "❌ Error: AWS_ECR_REGISTRY not found in secrets or config file" >&2
+            exit 1
+          })
+          
+          # Validate formats
+          if [[ ! "$ACCOUNT_ID" =~ ^[0-9]{12}$ ]]; then
+            echo "❌ Error: Invalid account_id format: $ACCOUNT_ID (must be 12 digits)" >&2
+            exit 1
+          fi
+          
+          if [[ ! "$REGION" =~ ^[a-z]{2}-[a-z]+-[0-9]+$ ]]; then
+            echo "❌ Error: Invalid region format: $REGION" >&2
+            exit 1
+          fi
+          
+          if [[ ! "$IAM_ROLE_ARN" =~ ^arn:aws:iam::[0-9]{12}:role/ ]]; then
+            echo "❌ Error: Invalid IAM role ARN format: $IAM_ROLE_ARN" >&2
+            exit 1
+          fi
+          
+          if [[ ! "$ECR_REGISTRY" =~ ^[0-9]{12}\.dkr\.ecr\.[a-z0-9-]+\.amazonaws\.com$ ]]; then
+            echo "❌ Error: Invalid ECR registry format: $ECR_REGISTRY" >&2
+            exit 1
+          fi
+          
+          # Determine config source
+          if [ -n "${AWS_ACCOUNT_ID:-}" ] && [ "${AWS_ACCOUNT_ID}" != "null" ]; then
+            CONFIG_SOURCE="GitHub Secrets"
+          elif [ -f "$CONFIG_FILE" ]; then
+            CONFIG_SOURCE="config/aws.json"
+          else
+            CONFIG_SOURCE="Environment Variables"
+          fi
+          
+          echo "✅ AWS configuration loaded from: $CONFIG_SOURCE"
+          echo ""
+          echo "📋 Configuration (ECR only):"
+          echo "  Account ID: $ACCOUNT_ID"
+          echo "  Region: $REGION"
+          echo "  IAM Role: $IAM_ROLE_ARN"
+          echo "  ECR Registry: $ECR_REGISTRY"
+          
+          # Output values for subsequent steps
+          echo "account_id=$ACCOUNT_ID" >> $GITHUB_OUTPUT
+          echo "region=$REGION" >> $GITHUB_OUTPUT
+          echo "iam_role_arn=$IAM_ROLE_ARN" >> $GITHUB_OUTPUT
+          echo "ecr_registry=$ECR_REGISTRY" >> $GITHUB_OUTPUT
+          echo "config_source=$CONFIG_SOURCE" >> $GITHUB_OUTPUT
+
+      - name: Validate AWS configuration
+        id: validate-config
+        run: |
+          # Values are already validated in previous step
+          # This step just ensures we have all required values
+          ACCOUNT_ID="${{ steps.aws-config-loader.outputs.account_id }}"
+          REGION="${{ steps.aws-config-loader.outputs.region }}"
+          IAM_ROLE_ARN="${{ steps.aws-config-loader.outputs.iam_role_arn }}"
+          ECR_REGISTRY="${{ steps.aws-config-loader.outputs.ecr_registry }}"
+          CONFIG_SOURCE="${{ steps.aws-config-loader.outputs.config_source }}"
+          
+          echo "✅ Configuration validated - Source: $CONFIG_SOURCE"
+          
+          # Output for backward compatibility
+          echo "account_id=$ACCOUNT_ID" >> $GITHUB_OUTPUT
+          echo "region=$REGION" >> $GITHUB_OUTPUT
+          echo "iam_role_arn=$IAM_ROLE_ARN" >> $GITHUB_OUTPUT
+          echo "ecr_registry=$ECR_REGISTRY" >> $GITHUB_OUTPUT
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ steps.validate-config.outputs.iam_role_arn }}
+          aws-region: ${{ steps.validate-config.outputs.region }}
+          role-session-name: GitHubActions-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Prepare AWS config outputs
+        id: aws-config
+        run: |
+          # Use values from config loader step (ECR only)
+          ACCOUNT_ID="${{ steps.aws-config-loader.outputs.account_id }}"
+          REGION="${{ steps.aws-config-loader.outputs.region }}"
+          ECR_REGISTRY="${{ steps.aws-config-loader.outputs.ecr_registry }}"
+          
+          # Pass through ECR config values
+          echo "account_id=$ACCOUNT_ID" >> $GITHUB_OUTPUT
+          echo "region=$REGION" >> $GITHUB_OUTPUT
+          echo "ecr_registry=$ECR_REGISTRY" >> $GITHUB_OUTPUT
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Generate immutable image tags
+        id: image-tags
+        run: |
+          set -euo pipefail
+          
+          # Extract branch name from ref (e.g., refs/heads/main -> main)
+          BRANCH_NAME="${GITHUB_REF#refs/heads/}"
+          SHORT_SHA="${GITHUB_SHA::7}"
+          FULL_SHA="${GITHUB_SHA}"
+          
+          # Generate tags based on event type and branch
+          if [ "${{ github.event_name }}" == "pull_request" ]; then
+            # PR: pr-{number}-{short-sha}
+            PRIMARY_TAG="pr-${{ github.event.pull_request.number }}-${SHORT_SHA}"
+            ADDITIONAL_TAGS="${FULL_SHA},pr-${{ github.event.pull_request.number }}"
+          elif [ "${{ github.ref }}" == "refs/heads/main" ]; then
+            # Main branch: main-{short-sha} (immutable production tag)
+            PRIMARY_TAG="main-${SHORT_SHA}"
+            ADDITIONAL_TAGS="${FULL_SHA},main-latest"
+          elif [ "${{ github.ref }}" == "refs/heads/develop" ]; then
+            # Develop branch: develop-{short-sha}
+            PRIMARY_TAG="develop-${SHORT_SHA}"
+            ADDITIONAL_TAGS="${FULL_SHA},develop-latest"
+          else
+            # Feature/other branches: {branch-name}-{short-sha}
+            # Sanitize branch name (replace / with -)
+            SANITIZED_BRANCH=$(echo "$BRANCH_NAME" | sed 's/[^a-zA-Z0-9-]/-/g')
+            PRIMARY_TAG="${SANITIZED_BRANCH}-${SHORT_SHA}"
+            ADDITIONAL_TAGS="${FULL_SHA}"
+          fi
+          
+          echo "tag=${PRIMARY_TAG}" >> $GITHUB_OUTPUT
+          echo "additional_tags=${ADDITIONAL_TAGS}" >> $GITHUB_OUTPUT
+          echo "full_sha=${FULL_SHA}" >> $GITHUB_OUTPUT
+          echo "short_sha=${SHORT_SHA}" >> $GITHUB_OUTPUT
+          
+          echo "📋 Image Tags:"
+          echo "  Primary: ${PRIMARY_TAG}"
+          echo "  Additional: ${ADDITIONAL_TAGS}"
+          echo "  Full SHA: ${FULL_SHA}"
+
+      - name: Build Docker image
+        env:
+          COMPONENT: ${{ matrix.component }}
+          ECR_REGISTRY: ${{ steps.aws-config.outputs.ecr_registry }}
+          AWS_REGION: ${{ steps.aws-config.outputs.region }}
+        run: |
+          set -euo pipefail
+          
+          # Get tags from previous step
+          PRIMARY_TAG="${{ steps.image-tags.outputs.tag }}"
+          ADDITIONAL_TAGS="${{ steps.image-tags.outputs.additional_tags }}"
+          
+          echo "🔨 Building component: $COMPONENT"
+          echo "   Region: $AWS_REGION"
+          echo "   Primary tag: ${PRIMARY_TAG}"
+          
+          # Validate component directory exists
+          if [ ! -d "components/$COMPONENT" ]; then
+            echo "❌ Error: Component directory not found: components/$COMPONENT"
+            exit 1
+          fi
+          
+          # Validate Dockerfile exists
+          if [ ! -f "components/$COMPONENT/Dockerfile" ]; then
+            echo "❌ Error: Dockerfile not found: components/$COMPONENT/Dockerfile"
+            exit 1
+          fi
+          
+          # Build Docker image with immutable tags (BigTech ML standard)
+          BUILD_CMD="docker build -t $ECR_REGISTRY/$COMPONENT:${PRIMARY_TAG}"
+          
+          # Add additional tags (full SHA and branch-latest for main/develop)
+          IFS=',' read -ra TAG_ARRAY <<< "$ADDITIONAL_TAGS"
+          for tag in "${TAG_ARRAY[@]}"; do
+            if [ -n "$tag" ]; then
+              BUILD_CMD="$BUILD_CMD -t $ECR_REGISTRY/$COMPONENT:${tag}"
+            fi
+          done
+          
+          BUILD_CMD="$BUILD_CMD -f components/$COMPONENT/Dockerfile components/$COMPONENT/"
+          
+          echo "Building with tags:"
+          echo "  Primary: ${PRIMARY_TAG}"
+          for tag in "${TAG_ARRAY[@]}"; do
+            if [ -n "$tag" ]; then
+              echo "  Additional: ${tag}"
+            fi
+          done
+          
+          eval $BUILD_CMD
+          
+          echo "✅ Build completed for $COMPONENT:${PRIMARY_TAG}"
+
+      - name: Verify ECR repository exists
+        env:
+          COMPONENT: ${{ matrix.component }}
+          ECR_REGISTRY: ${{ steps.aws-config.outputs.ecr_registry }}
+          AWS_REGION: ${{ steps.aws-config.outputs.region }}
+          ACCOUNT_ID: ${{ steps.aws-config.outputs.account_id }}
+        run: |
+          set -euo pipefail
+          
+          REPO_NAME="$COMPONENT"
+          echo "🔍 Verifying ECR repository: $REPO_NAME"
+          
+          # Check if repository exists, create if not
+          if ! aws ecr describe-repositories --repository-names "$REPO_NAME" --region "$AWS_REGION" &>/dev/null; then
+            echo "📦 Creating ECR repository: $REPO_NAME"
+            aws ecr create-repository \
+              --repository-name "$REPO_NAME" \
+              --region "$AWS_REGION" \
+              --image-scanning-configuration scanOnPush=true \
+              --encryption-configuration encryptionType=AES256 || true
+            echo "✅ Repository created (or already exists)"
+          else
+            echo "✅ Repository already exists"
+          fi
+
+      - name: Push Docker images to ECR
+        env:
+          COMPONENT: ${{ matrix.component }}
+          ECR_REGISTRY: ${{ steps.aws-config.outputs.ecr_registry }}
+          PRIMARY_TAG: ${{ steps.image-tags.outputs.tag }}
+          ADDITIONAL_TAGS: ${{ steps.image-tags.outputs.additional_tags }}
+          AWS_REGION: ${{ steps.aws-config.outputs.region }}
+        run: |
+          set -euo pipefail
+          
+          echo "🚀 Pushing images to ECR with immutable tags..."
+          
+          # Function to push with retry
+          push_with_retry() {
+            local image_tag=$1
+            local max_retries=3
+            local retry_count=0
+            
+            while [ $retry_count -lt $max_retries ]; do
+              if docker push "$ECR_REGISTRY/$COMPONENT:${image_tag}"; then
+                echo "✅ Successfully pushed $ECR_REGISTRY/$COMPONENT:${image_tag}"
+                return 0
+              else
+                retry_count=$((retry_count + 1))
+                if [ $retry_count -lt $max_retries ]; then
+                  echo "⚠️  Push failed for ${image_tag}, retrying ($retry_count/$max_retries)..."
+                  sleep 5
+                else
+                  echo "❌ Failed to push ${image_tag} after $max_retries attempts"
+                  return 1
+                fi
+              fi
+            done
+            return 1
+          }
+          
+          # Push primary tag (immutable)
+          if ! push_with_retry "${PRIMARY_TAG}"; then
+            echo "❌ Failed to push primary tag"
+            exit 1
+          fi
+          
+          # Push additional tags (full SHA and branch-latest if applicable)
+          IFS=',' read -ra TAG_ARRAY <<< "$ADDITIONAL_TAGS"
+          for tag in "${TAG_ARRAY[@]}"; do
+            if [ -n "$tag" ]; then
+              echo "🏷️  Pushing additional tag: ${tag}"
+              if ! push_with_retry "${tag}"; then
+                echo "⚠️  Warning: Failed to push tag ${tag} (non-fatal)"
+              fi
+            fi
+          done
+          
+          # Display image digest (from primary tag)
+          IMAGE_DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' $ECR_REGISTRY/$COMPONENT:${PRIMARY_TAG} 2>/dev/null || echo "N/A")
+          echo "📋 Image digest: $IMAGE_DIGEST"
+
+      - name: Build Summary
+        env:
+          COMPONENT: ${{ matrix.component }}
+          ECR_REGISTRY: ${{ steps.aws-config.outputs.ecr_registry }}
+          PRIMARY_TAG: ${{ steps.image-tags.outputs.tag }}
+          ADDITIONAL_TAGS: ${{ steps.image-tags.outputs.additional_tags }}
+          FULL_SHA: ${{ steps.image-tags.outputs.full_sha }}
+          SHORT_SHA: ${{ steps.image-tags.outputs.short_sha }}
+          AWS_REGION: ${{ steps.aws-config.outputs.region }}
+          ACCOUNT_ID: ${{ steps.aws-config.outputs.account_id }}
+        run: |
+          echo "### ✅ Build and Push Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Component** | \`$COMPONENT\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Primary Tag** | \`${PRIMARY_TAG}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Full SHA** | \`${FULL_SHA}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Short SHA** | \`${SHORT_SHA}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Registry** | \`$ECR_REGISTRY\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Region** | \`$AWS_REGION\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Account ID** | \`$ACCOUNT_ID\` |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Primary Image URL:**" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          echo "$ECR_REGISTRY/$COMPONENT:${PRIMARY_TAG}" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ -n "$ADDITIONAL_TAGS" ]; then
+            echo "**Additional Tags:**" >> $GITHUB_STEP_SUMMARY
+            IFS=',' read -ra TAG_ARRAY <<< "$ADDITIONAL_TAGS"
+            for tag in "${TAG_ARRAY[@]}"; do
+              if [ -n "$tag" ]; then
+                echo "- \`$ECR_REGISTRY/$COMPONENT:${tag}\`" >> $GITHUB_STEP_SUMMARY
+              fi
+            done
+          fi
